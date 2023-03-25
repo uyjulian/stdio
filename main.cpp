@@ -1,16 +1,32 @@
+#include <windows.h>
+#include <ncbind.hpp>
+
 #include <stdio.h>
 #include <iostream>
 #include <string>
-#include "ncbind/ncbind.hpp"
+
 
 struct Stdio
 {
+	static bool isConsoleStdin;
+	static bool isConsoleStdout;
+	static bool isConsoleStderr;
+
 	static int getState() {
 		int state = 0;
 		if (_fileno(stdin)  >= 0) state |= 0x01;
 		if (_fileno(stdout) >= 0) state |= 0x02;
 		if (_fileno(stderr) >= 0) state |= 0x04;
 		return state;
+	}
+
+	static void initLocale() {
+		SetConsoleCP(CP_UTF8);
+		SetConsoleOutputCP(CP_UTF8);
+		auto locale = std::locale(".UTF-8");
+		std::wcin.imbue(locale);
+		std::wcout.imbue(locale);
+		std::wcerr.imbue(locale);
 	}
 
 	// コンソールと接続
@@ -35,13 +51,16 @@ struct Stdio
 			HINSTANCE hDLL = LoadLibrary(L"kernel32.dll");
 			AttachConsoleFunc AttachConsole = (AttachConsoleFunc)GetProcAddress(hDLL, "AttachConsole");
 			if (AttachConsole && (*AttachConsole)(-1)) {
-				if ((state & 0x01)) freopen("CON", "r", stdin); 
-				if ((state & 0x02)) freopen("CON", "w", stdout);
-				if ((state & 0x04)) freopen("CON", "w", stderr);
+				if ((state & 0x01)) { freopen("CON", "r", stdin); isConsoleStdin = true; }
+				if ((state & 0x02)) { freopen("CON", "w", stdout); isConsoleStdout = true; }
+				if ((state & 0x04)) { freopen("CON", "w", stderr); isConsoleStderr = true; }
 			} else {
 				ret = false;
 			}
 			FreeLibrary(hDLL);
+		}
+		if (ret) {
+			initLocale();
 		}
 		if (result) {
 			*result = ret;
@@ -64,12 +83,15 @@ struct Stdio
 		// 接続先が無い場合はコンソールを開いてそこに接続する
 		if (state != 0) {
 			if (::AllocConsole()) {
-				if ((state & 0x01)) freopen("CON", "r", stdin); 
-				if ((state & 0x02)) freopen("CON", "w", stdout);
-				if ((state & 0x04)) freopen("CON", "w", stderr);
+				if ((state & 0x01)) { freopen("CON", "r", stdin); isConsoleStdin = true; }
+				if ((state & 0x02)) { freopen("CON", "w", stdout); isConsoleStdout = true; }
+				if ((state & 0x04)) { freopen("CON", "w", stderr); isConsoleStderr = true; }
 			} else {
 				ret = false;
 			}
+		}
+		if (ret) {
+			initLocale();
 		}
 		if (result) {
 			*result = ret;
@@ -94,28 +116,20 @@ struct Stdio
 										tTJSVariant **param,
 										iTJSDispatch2 *objthis) {
 		if (result) {
-			bool utf8 = numparams> 0 && (int)*param[0] != 0;
-			std::string str;
-			std::getline(std::cin, str);
-			if (utf8) {
-				const char *s = str.c_str();
-				tjs_int len = TVPUtf8ToWideCharString(s, NULL);
-				if (len > 0) {
-					tjs_char *dat = new tjs_char[len+1];
-					try {
-						TVPUtf8ToWideCharString(s, dat);
-						dat[len] = TJS_W('\0');
-					}
-					catch(...) {
-						delete [] dat;
-						throw;
-					}
-					*result = ttstr(dat);
-					delete [] dat;
-				}				
+			std::wstring str;
+			if (isConsoleStdin) {
+				// windows のバグ対策。なぜかコンソールだと stdin から Unicodeがよめない
+				wchar_t buf[2048+1];
+				DWORD readNum;
+				::ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buf, 2048, &readNum, NULL);
+				if (readNum > 0) {
+					buf[readNum] = '\0';
+					str = buf;
+				}				 
 			} else {
-				*result = ttstr(str.c_str());
+				std::getline(std::wcin, str);
 			}
+			*result = ttstr(str.c_str());
 		}
 		return TJS_S_OK;
 	}
@@ -123,36 +137,15 @@ struct Stdio
 	// テキスト出力下請け関数
 	static tjs_error TJS_INTF_METHOD _out(tjs_int numparams,
 										  tTJSVariant **param,
-										  std::ostream &os) {
+										  std::wostream &wos,
+										  HANDLE handle) {
 		if (numparams > 0) {
-			bool utf8 = numparams> 1 && (int)*param[1] != 0;
 			ttstr str = *param[0];
-			if (utf8) {
-				const tjs_char *s = str.c_str();
-				tjs_int len = TVPWideCharToUtf8String(s, NULL);
-				char *dat = new char [len+1];
-				try {
-					TVPWideCharToUtf8String(s, dat);
-					dat[len] = '\0';
-				}
-				catch(...)	{
-					delete [] dat;
-					throw;
-				}
-				os << dat;
-				delete [] dat;
+			if (handle) {
+				DWORD writeNum;
+				::WriteConsoleW(handle, str.c_str(), str.length(), &writeNum, NULL);
 			} else {
-				tjs_int len = str.GetNarrowStrLen();
-				tjs_nchar *dat = new tjs_nchar[len+1];
-				try {
-					str.ToNarrowStr(dat, len+1);
-				}
-				catch(...)	{
-					delete [] dat;
-					throw;
-				} 
-				os << dat;
-				delete [] dat;
+				wos << str.c_str();
 			}
 		}
 		return TJS_S_OK;
@@ -163,7 +156,7 @@ struct Stdio
 										 tjs_int numparams,
 										 tTJSVariant **param,
 										 iTJSDispatch2 *objthis) {
-		return _out(numparams, param, std::cout);
+		return _out(numparams, param, std::wcout, isConsoleStdout ? GetStdHandle(STD_OUTPUT_HANDLE) : 0);
 	}
 	
 	// 標準エラー出力にテキストを出力
@@ -171,7 +164,7 @@ struct Stdio
 										 tjs_int numparams,
 										 tTJSVariant **param,
 										 iTJSDispatch2 *objthis) {
-		return _out(numparams, param, std::cerr);
+		return _out(numparams, param, std::wcerr, isConsoleStderr ? GetStdHandle(STD_ERROR_HANDLE) : 0);
 	}
 
 	// 標準出力をフラッシュ
@@ -179,10 +172,14 @@ struct Stdio
 										   tjs_int numparams,
 										   tTJSVariant **param,
 										   iTJSDispatch2 *objthis) {
-		std::cout << std::flush;
+		std::wcout << std::flush;
 		return TJS_S_OK;
 	}
 };
+
+bool Stdio::isConsoleStdin = false;
+bool Stdio::isConsoleStdout = false;
+bool Stdio::isConsoleStderr = false;
 
 NCB_ATTACH_CLASS(Stdio, System) {
 	Property("stdioState", &Stdio::getState, 0);

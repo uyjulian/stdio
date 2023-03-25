@@ -1,3 +1,7 @@
+build
+savedata
+.vscode
+*.exe
 *.pdb
 *.obj
 *.lib
